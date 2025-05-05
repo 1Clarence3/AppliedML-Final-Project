@@ -1,0 +1,326 @@
+```{r}
+
+#--- 0. Load packages ---------------------------------------------------------
+# If you don’t have them, uncomment and run:
+# install.packages(c("tidyverse","skimr","GGally","naniar","caret","randomForest","MLmetrics"))
+library(tidyverse)
+library(skimr)      # quick summaries
+library(corrplot)     # correlation matrix plot
+library(naniar)     # missingness visualizations
+library(caret)      # modeling & CV
+library(randomForest)
+library(MLmetrics)  # RMSE
+
+
+#--- 1. Load data & basic EDA ------------------------------------------------
+data_path <- "projectdata.csv"    # adjust as needed
+df <- read_csv(data_path)
+
+# Shape
+cat("Rows × Cols:", dim(df), "\n")
+# Column types and head
+glimpse(df)
+head(df)
+
+# Count of NAs per column
+colSums(is.na(df))
+
+# Visual map of missingness
+gg_miss_var(df) +
+  labs(title = "Missing Values by Column")
+
+
+
+
+```
+
+```{r}
+
+
+# Summary stats
+skim(df %>% select(
+  median_income, nonfamily_income,
+  housing_price, permits, Affordability_Index
+))
+
+# Histograms
+df %>% select(median_income, housing_price, Affordability_Index) %>%
+  pivot_longer(everything(), names_to = "var", values_to = "val") %>%
+  ggplot(aes(x = val)) +
+  geom_histogram(bins = 50, fill = "skyblue", color = "white") +
+  facet_wrap(~var, scales = "free") +
+  labs(title = "Distributions of Key Variables")
+
+
+
+```
+
+```{r}
+
+df %>% select(median_income, housing_price, permits) %>%
+  pivot_longer(everything(), names_to="var", values_to="val") %>%
+  ggplot(aes(x = var, y = val)) +
+  geom_boxplot(fill="lightgreen") +
+  coord_flip() +
+  labs(title="Boxplots to Highlight Outliers")
+
+
+
+```
+
+```{r}
+
+# Select numeric predictors + target
+num_df <- df %>%
+  select(median_income, nonfamily_income, housing_price,
+         permits, income_25_44, income_45_64,
+         Income_to_Permits, Price_to_Permits,
+         Affordability_Index)
+
+
+# compute correlation matrix
+num_df <- df %>% 
+  select(median_income, nonfamily_income, housing_price,
+         permits, income_25_44, income_45_64,
+         Income_to_Permits, Price_to_Permits,
+         Affordability_Index)
+
+M <- cor(num_df)
+corrplot(M, method="color", addCoef.col="black", tl.cex=0.8,
+         title="Correlation Matrix", mar=c(0,0,1,0))
+
+
+```
+
+```{r}
+
+
+df %>%
+  group_by(year) %>%
+  summarise(
+    avg_median_income = mean(median_income),
+    avg_housing_price = mean(housing_price),
+    avg_afford_index = mean(Affordability_Index)
+  ) %>%
+  pivot_longer(-year, names_to="metric", values_to="value") %>%
+  ggplot(aes(x=year, y=value, color=metric)) +
+    geom_line(size=1) +
+    scale_y_continuous(labels=scales::comma) +
+    labs(title="National Averages Over Time",
+         y="Value", color="Metric") +
+    theme_minimal()
+
+
+
+```
+
+
+
+```{r}
+
+
+df <- df %>%
+  mutate(
+    price_income_ratio = housing_price / median_income,
+    log_price = log(housing_price),
+    log_income = log(median_income)
+  )
+
+# Correlations with target
+tibble(
+  feature = c("price_income_ratio","log_price","log_income"),
+  corr   = c(
+    cor(df$price_income_ratio, df$Affordability_Index),
+    cor(df$log_price, df$Affordability_Index),
+    cor(df$log_income, df$Affordability_Index)
+  )
+) %>% 
+  arrange(desc(abs(corr)))
+
+
+
+```
+
+```{r}
+
+
+y <- df$Affordability_Index
+baseline_pred <- rep(mean(y), length(y))
+baseline_rmse <- RMSE(baseline_pred, y)
+cat("Baseline RMSE (mean predictor):", round(baseline_rmse, 4), "\n")
+
+
+```
+
+```{r}
+
+
+set.seed(42)
+features <- c(
+  "median_income","nonfamily_income","housing_price","permits",
+  "income_25_44","income_45_64",
+  "Income_to_Permits","Price_to_Permits",
+  "price_income_ratio","log_price","log_income"
+)
+
+ctrl <- trainControl(method="cv", number=5, verboseIter=FALSE)
+rf_fit <- train(
+  x = df[features],
+  y = df$Affordability_Index,
+  method = "rf",
+  trControl = ctrl,
+  metric = "RMSE",
+  tuneLength = 3
+)
+
+# CV results table
+rf_fit$resample %>%
+  mutate(Fold = row_number()) %>%
+  select(Fold, RMSE) %>%
+  knitr::kable(digits=6, caption="5-Fold CV RMSE for Random Forest")
+
+
+```
+
+
+```{r}
+
+
+df$pred <- predict(rf_fit, df[features])
+
+ggplot(df, aes(x=Affordability_Index, y=pred)) +
+  geom_point(alpha=0.3) +
+  geom_abline(linetype="dashed") +
+  labs(title="Predicted vs. Actual Affordability",
+       x="Actual", y="Predicted") +
+  theme_minimal()
+
+```
+
+
+```{r}
+
+# make sure tibble/dplyr are loaded
+library(dplyr)
+library(tibble)
+
+# 1) get variable importance from the caret model (not the raw randomForest object)
+imp <- varImp(rf_fit)
+
+# 2) turn the importance matrix into a tibble, rename "Overall" → "Importance", then sort
+imp_df <- imp$importance %>%
+  rownames_to_column(var = "Feature") %>%
+  rename(Importance = Overall) %>%
+  arrange(desc(Importance))
+
+# 3) view it
+print(imp_df)
+
+# 4) plot it
+library(ggplot2)
+ggplot(imp_df, aes(x = reorder(Feature, Importance), y = Importance)) +
+  geom_col() +
+  coord_flip() +
+  labs(
+    title = "Random Forest Feature Importances",
+    x = NULL, y = "Importance (scaled)"
+  ) +
+  theme_minimal()
+
+
+
+```
+
+
+```{r}
+
+
+
+threshold <- quantile(df$Affordability_Index, 0.99)
+df_sub <- df %>% filter(Affordability_Index < threshold)
+
+set.seed(42)
+rf_sub <- train(
+  x = df_sub[features],
+  y = df_sub$Affordability_Index,
+  method = "rf",
+  trControl = ctrl,
+  metric = "RMSE",
+  tuneGrid = rf_fit$bestTune
+)
+
+rf_sub$resample %>%
+  mutate(Fold = row_number()) %>%
+  select(Fold, RMSE) %>%
+  knitr::kable(digits=6, caption="CV RMSE Without Top 1% Target Values")
+
+
+
+
+```
+
+```{r}
+
+#--- 10. Principal Components Regression (PCR) --------------------------------
+# Why?  PCR reduces your 11+ features to a handful of orthogonal components 
+#       that capture most variance, then regresses on those.
+
+set.seed(42)
+pcr_fit <- train(
+  x = df[features],
+  y = df$Affordability_Index,
+  method     = "pcr",
+  preProcess = c("center","scale"),
+  trControl  = ctrl,
+  tuneLength = 10,      # will try 1:10 components
+  metric     = "RMSE"
+)
+
+# Print & plot performance vs # components
+print(pcr_fit)
+plot(pcr_fit, main = "PCR: RMSE vs. # of PCs")
+
+# Extract the chosen number of components
+best_ncomp <- pcr_fit$bestTune$ncomp
+cat("Optimal # of PCs:", best_ncomp, "\n\n")
+
+
+#--- 11. Elastic Net Regression ------------------------------------------------
+# Why?  Elastic Net (a mix of L1 & L2 penalties) will shrink many coefficients 
+#       toward zero and select only those features that truly matter.
+
+# make sure glmnet is installed
+if (!requireNamespace("glmnet", quietly=TRUE)) install.packages("glmnet")
+library(glmnet)
+
+# Define a grid of alpha (0=Ridge → 1=Lasso) and let caret tune lambda
+enet_grid <- expand.grid(
+  alpha  = seq(0, 1, by = 0.1),
+  lambda = 10^seq(-4, 1, length = 100)
+)
+
+set.seed(42)
+enet_fit <- train(
+  x          = df[features],
+  y          = df$Affordability_Index,
+  method     = "glmnet",
+  preProcess = c("center","scale"),
+  tuneGrid   = enet_grid,
+  trControl  = ctrl,
+  metric     = "RMSE"
+)
+
+# Print & plot the CV surface
+print(enet_fit)
+plot(enet_fit, main = "Elastic Net: RMSE Surface")
+
+# Extract non-zero coefficients at the optimal lambda
+opt <- enet_fit$bestTune
+coef_mat <- coef(enet_fit$finalModel, s = opt$lambda)
+nz_coefs  <- as.matrix(coef_mat)[which(coef_mat != 0), , drop=FALSE]
+cat("Non-zero coefficients (at alpha =", opt$alpha, "lambda =", round(opt$lambda,4), "):\n")
+print(nz_coefs)
+
+
+
+```
