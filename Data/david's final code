@@ -1,0 +1,416 @@
+---
+title: "Proj2"
+author: "David Moran"
+date: "2025-05-06"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## “Which socioeconomic and housing-market factors most strongly influence year-over-year county-level housing-price growth, and how do those drivers vary across Census regions and over time?”
+
+```{R, warning = FALSE}
+
+#1. Load Packages & Helpers 
+required <- c(
+  "tidyverse","skimr","naniar","corrplot",
+  "caret","randomForest","MLmetrics",
+  "tigris","sf","purrr","ggthemes"
+)
+new_pkgs  <- setdiff(required, rownames(installed.packages()))
+if(length(new_pkgs)) install.packages(new_pkgs)
+lapply(required, library, character.only=TRUE)
+options(tigris_use_cache = TRUE)
+```
+
+```{r load-data}
+#2. Load Data & Inspect 
+data_path <- "updated_projectdata.csv"
+df        <- read_csv(data_path)
+cat("Rows × Cols:", dim(df), "\n")
+glimpse(df)
+```
+
+```{r uni-eda}
+#Univariate EDA 
+skim(df %>% select(
+  median_income, housing_price, permits, Affordability_Index
+))
+
+df %>% select(median_income, housing_price, Affordability_Index) %>%
+  pivot_longer(everything(), names_to="var", values_to="val") %>%
+  ggplot(aes(val)) +
+    geom_histogram(bins=40, fill="skyblue", color="white") +
+    facet_wrap(~var, scales="free") +
+    labs(title="Key Variable Distributions")
+```
+
+```{r corr-matrix}
+#=== 5. Correlation Analysis =================================================
+num_df <- df %>%
+  select(median_income, nonfamily_income, housing_price,
+         permits, income_25_44, income_45_64,
+         Income_to_Permits, Price_to_Permits,
+         Affordability_Index)
+M <- cor(num_df, use="pairwise.complete.obs")
+corrplot(M, method="color", addCoef.col="black",
+         tl.cex=0.7, title="Correlation Matrix", mar=c(0,0,1,0))
+```
+
+```{r time-trends-fixed}
+#=== 6. Temporal Trends ======================================================
+df %>%
+  group_by(year) %>%
+  summarize(avg_price = mean(housing_price, na.rm=TRUE)) %>%
+  ggplot(aes(year, avg_price)) +
+    geom_line(color="steelblue", size=1) +
+    geom_point(color="steelblue", size=2) +
+    scale_y_continuous(labels=scales::dollar_format()) +
+    labs(title="Average County Housing Price by Year", x="Year", y="Avg. Price (USD)") +
+    theme_minimal()
+
+df %>%
+  arrange(county, year) %>%
+  group_by(county) %>%
+  mutate(growth = (housing_price - lag(housing_price)) / lag(housing_price)) %>%
+  ungroup() %>%
+  group_by(year) %>%
+  summarize(avg_growth = mean(growth, na.rm=TRUE)) %>%
+  ggplot(aes(year, avg_growth)) +
+    geom_line(color="darkgreen", size=1) +
+    geom_point(color="darkgreen", size=2) +
+    scale_y_continuous(labels=scales::percent_format(accuracy=1)) +
+    labs(title="Average Annual Housing Price Growth by Year", x="Year", y="Avg. Growth Rate") +
+    theme_minimal()
+```
+
+```{r spatial-choropleth}
+#=== 7. Spatial Choropleth ===================================================
+df_map <- df %>%
+  mutate(
+    GEO_chr     = as.character(GEO_ID),
+    state_fips  = substr(GEO_chr, 1, 2),
+    county_fips = substr(GEO_chr, 3, 5),
+    GEOID       = paste0(state_fips, county_fips),
+    growth_rate = (housing_price - lag(housing_price)) / lag(housing_price)
+  ) %>% filter(!is.na(growth_rate))
+
+counties_sf <- counties(cb=TRUE, year=2020, class="sf") %>% select(GEOID, geometry)
+map_df <- left_join(counties_sf, df_map, by="GEOID")
+
+ggplot(map_df) +
+  geom_sf(aes(fill=growth_rate), color=NA) +
+  scale_fill_viridis_c(labels=scales::percent_format()) +
+  labs(title="County‐Level Annual Housing Price Growth", fill="Growth Rate") +
+  theme_void()
+```
+
+```{r feat-eng}
+#=== 8. Feature Engineering ==================================================
+df <- df %>%
+  arrange(county, year) %>%
+  group_by(county) %>%
+    mutate(
+      price_lag           = lag(housing_price),
+      growth_rate         = (housing_price - price_lag) / price_lag,
+      median_inc_lag      = lag(median_income),
+      pop_lag      = lag(population),
+      permits_lag         = lag(permits),
+      price_income_ratio  = housing_price / median_income,
+       pop_change   = (population - pop_lag) / pop_lag,
+      log_price           = log(housing_price),
+      log_income          = log(median_income)
+    ) %>%
+  ungroup() %>% filter(!is.na(growth_rate))
+```
+
+
+```{r}
+
+
+
+#=== 9. Define Features & CV Control ========================================
+features <- c("pop_change","permits_lag")
+ctrl     <- trainControl(method="cv", number=5)
+```
+
+```{r baseline-lm}
+#=== 10. Baseline Model: Linear Regression ===================================
+# What: Predict growth as a linear function of pop_change and permits_lag
+# How: 5-fold CV via caret::train(method="lm")
+
+
+# filter out any rows with NA in the response or predictors
+df_model <- df %>%
+  drop_na(growth_rate, pop_change, permits_lag)
+
+set.seed(42)
+lm_baseline <- train(
+  growth_rate ~ pop_change + permits_lag,
+  data      = df_model,
+  method    = "lm",
+  trControl = ctrl,
+  metric    = "RMSE"
+)
+
+# Report baseline performance
+cat("Linear Baseline CV RMSE:", round(lm_baseline$results$RMSE,4), "  ")
+cat("CV MAE:", round(lm_baseline$results$MAE,4), "\n")
+
+
+```
+
+
+
+
+```{r rf-cv}
+#=== 10. Random Forest & CV ==================================================
+# What: fit RF with 5-fold CV; Why: powerful nonparametric model + generalization test
+features  <- c(
+  "median_inc_lag","nonfamily_income","permits_lag",
+  "income_25_44","income_45_64",
+  "Income_to_Permits","Price_to_Permits",
+  "price_income_ratio","log_price","log_income"
+)
+y <- df$growth_rate
+
+set.seed(42)
+ctrl      <- trainControl(method="cv", number=5)
+rf_growth <- train(
+  x = df[features], y = y,
+  method    = "rf",
+  trControl = ctrl,
+  metric    = "RMSE",
+  tuneLength= 3
+)
+rf_growth$resample %>%
+  mutate(Fold = row_number()) %>%
+  select(Fold, RMSE) %>%
+  knitr::kable(digits=6, caption="RF CV RMSE for Growth")
+
+#=== 10b. Random Forest Feature Importances ==================================
+# What: rank drivers of growth; Why: understand which predictors matter most
+imp_rf <- varImp(rf_growth)$importance %>%
+  rownames_to_column(var = "Feature") %>%
+  rename(Importance = Overall) %>%
+  arrange(desc(Importance))
+
+# Display top 10 features
+imp_rf %>% head(10) %>% knitr::kable(digits=3, caption="Top 10 RF Feature Importances")
+
+# Plot top 5 importances
+ggplot(imp_rf[1:5, ], aes(x = reorder(Feature, Importance), y = Importance)) +
+  geom_col(fill = "darkgreen") +
+  coord_flip() +
+  labs(title = "Top 5 Random Forest Predictors", y = "Importance (scaled)", x = NULL) +
+  theme_minimal()
+
+```
+
+
+```{r}
+
+#=== 9. Define Features & CV Control ========================================
+# What: Set up feature list and CV control for all models
+features <- c(
+  "median_inc_lag","nonfamily_income","permits_lag",
+  "income_25_44","income_45_64",
+  "Income_to_Permits","Price_to_Permits",
+  "price_income_ratio","log_price","log_income"
+)
+ctrl <- trainControl(method="cv", number=5)
+
+#=== 10. Baseline Model: Ridge Regression =====================================
+# What: Use ridge regression as the ‘dumb yet reasonable’ baseline leveraging penalized linear modeling
+# How: 5-fold CV over lambda grid with alpha=0 via caret::train
+# Why: Handles multicollinearity and provides a stronger parametric benchmark than mean or simple persistence
+
+y <- df$growth_rate
+ridge_grid <- expand.grid(alpha = 0,
+                          lambda = 10^seq(-4, 1, length = 50))
+set.seed(42)
+ridge_baseline <- train(
+  x          = df[features],
+  y          = y,
+  method     = "glmnet",
+  preProcess = c("center","scale"),
+  tuneGrid   = ridge_grid,
+  trControl  = ctrl,
+  metric     = "RMSE"
+)
+# Report baseline performance
+cat("Ridge Baseline - best lambda:", ridge_baseline$bestTune$lambda, "
+")
+cat("Ridge Baseline CV RMSE:", round(min(ridge_baseline$results$RMSE),4), "
+")
+cat("Ridge Baseline CV MAE:", round(min(ridge_baseline$results$MAE, na.rm=TRUE),4), "
+")
+``` 
+
+
+```{r}
+
+#=== 13. Model Comparison: Linear vs Ridge vs Random Forest =================
+mod_results <- tibble(
+  Model   = c("Linear Regression", "Ridge Baseline", "Random Forest"),
+  RMSE_CV = c(
+    min(lm_baseline$results$RMSE),
+    min(ridge_baseline$results$RMSE),
+    min(rf_growth$results$RMSE)
+  )
+)
+
+# Display comparison table
+knitr::kable(mod_results, digits=4, caption="CV RMSE: Linear vs Ridge vs RF")
+
+# Bar plot of RMSE
+ggplot(mod_results, aes(x=Model, y=RMSE_CV, fill=Model)) +
+  geom_col() +
+  labs(
+    title = "Cross-Validation RMSE: Linear vs Ridge vs RF",
+    y     = "RMSE",
+    x     = "Model"
+  ) +
+  theme_minimal()
+
+
+```
+
+
+
+```{R}
+
+
+years <- sort(unique(df$year))
+imp_time <- map_df(years, function(yr){
+  sub <- filter(df, year==yr)
+  rf  <- randomForest(x=sub[features], y=sub$growth_rate)
+  imp <- importance(rf)[,1]
+  tibble(Year=yr, Feature=names(imp), Importance=imp)
+})
+
+
+top_feats <- imp_time %>%
+  group_by(Feature) %>%
+  summarize(mean_imp=mean(Importance)) %>%
+  slice_max(mean_imp, n=5) %>%
+  pull(Feature)
+
+imp_time %>%
+  filter(Feature %in% top_feats) %>%
+  ggplot(aes(x=Year,y=Importance,color=Feature)) +
+    geom_line(size=1) + geom_point() +
+    labs(title="Top 5 Predictors: Importance Over Time")
+
+
+```
+
+
+```{r}
+
+library(ggplot2)
+library(tidytext)
+
+#=== 14. Feature‐Importance for Linear & Ridge ================================
+
+
+# Ridge regression importances:
+imp_ridge <- varImp(ridge_baseline)$importance %>%
+  rownames_to_column("Feature") %>%
+  rename(Importance = Overall) %>%
+  mutate(Model = "Ridge")
+
+# You already have RF importances in imp_rf, so just add a model column:
+imp_rf2 <- imp_rf %>% mutate(Model = "RF")
+
+# Combine all three:
+imp_all <- bind_rows(imp_ridge, imp_rf2)
+
+#=== 15. Plot Top 5 per Model =================================================
+top5_all <- imp_all %>%
+  group_by(Model) %>%
+  slice_max(order_by = Importance, n = 5) %>%
+  ungroup()
+
+ggplot(top5_all, aes(x = reorder_within(Feature, Importance, Model),
+                     y = Importance, fill = Model)) +
+  geom_col(show.legend = FALSE) +
+  facet_wrap(~ Model, scales = "free_y") +
+  scale_x_reordered() +
+  coord_flip() +
+  labs(title = "Top 5 Predictors by Model (Coefficient‐based Importance)",
+       x = NULL, y = "Importance (absolute, scaled)") +
+  theme_minimal()
+
+
+
+```
+
+
+
+
+```{r}
+
+#=== 15. Spatial Variation of Importances (Balanced Sample)
+# What: Assess how key predictors vary across regions using a balanced Random Forest approach
+# How: First compute each region’s sample size, then randomly sample the same number of counties (min_n) from each region to avoid sample-size bias. For each region, fit a Random Forest to predict annual price growth (growth_rate) using our feature set and extract variable importances (increase in MSE when permuted).
+# Baseline: We previously established a mean-growth baseline RMSE (~0.10) and overall Random Forest CV RMSE (~0.02). Here, we hold the model type and hyperparameters fixed (the RF trained per region uses the same features and default parameters) and focus on comparing variable importances across regions.
+# Model: Random Forest regression (caret/RF) with balanced region-specific training sets.
+ 
+# A) Manual FIPS→Region mapping
+fips_to_region <- c(
+  "01"="South","02"="West","04"="West","05"="South","06"="West",
+  "08"="West","09"="Northeast","10"="South","11"="South","12"="South",
+  "13"="South","15"="West","16"="West","17"="Midwest","18"="Midwest",
+  "19"="Midwest","20"="Midwest","21"="South","22"="South","23"="Northeast",
+  "24"="South","25"="Northeast","26"="Midwest","27"="Midwest","28"="South",
+  "29"="Midwest","30"="West","31"="Midwest","32"="West","33"="Northeast",
+  "34"="Northeast","35"="West","36"="Northeast","37"="South","38"="Midwest",
+  "39"="Midwest","40"="South","41"="West","42"="Northeast","44"="Northeast",
+  "45"="South","46"="Midwest","47"="South","48"="South","49"="West",
+  "50"="Northeast","51"="South","53"="West","54"="South","55"="Midwest",
+  "56"="West"
+)
+
+df_regions <- df %>%
+  mutate(
+    GEO_chr    = as.character(GEO_ID),
+    state_fips = substr(GEO_chr, 1, 2),
+    region     = fips_to_region[state_fips]
+  )
+
+# B) Filter to valid regions and balance sample sizes
+region_counts <- df_regions %>%
+  filter(!is.na(region)) %>%
+  count(region, name="n")
+min_n <- min(region_counts$n)
+cat("Sampling", min_n, "rows per region for balanced RF fits.\n")
+
+set.seed(42)
+imp_reg_balanced <- map_df(region_counts$region, function(rgn) {
+  sub      <- filter(df_regions, region == rgn)
+  sub_samp <- sample_n(sub, min_n)
+  rf       <- randomForest(x = sub_samp[features], y = sub_samp$growth_rate)
+  im       <- importance(rf)[,1]
+  tibble(
+    Region     = rgn,
+    Feature    = names(im),
+    Importance = im
+  )
+})
+
+# C) Plot balanced importances for top features
+imp_reg_balanced %>%
+  filter(Feature %in% imp_rf$Feature[1:5]) %>%
+  ggplot(aes(x = Region, y = Importance, fill = Region)) +
+    geom_col(position = "dodge") +
+    facet_wrap(~ Feature, scales = "free_y") +
+    labs(
+      title = "Top Predictors of Price Growth by Region (Balanced Samples)",
+      y     = "Importance (IncMSE)"
+    ) +
+    theme_minimal() +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
