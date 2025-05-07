@@ -1,0 +1,260 @@
+---
+title: "project2_"
+author: "David Moran"
+date: "2025-05-06"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+# Load required packages
+library(tidyverse)
+library(caret)
+library(randomForest)
+library(MLmetrics)
+library(sf)
+library(tigris)
+library(scales)
+
+
+
+```
+
+## 1. Load Data & Initial Inspection
+
+```{r}
+df <- read_csv("updated_projectdata.csv") %>%
+  mutate(
+    year       = as.integer(year),
+    county     = factor(county),
+    GEO_chr    = as.character(GEO_ID)
+  )
+head(df)
+```
+
+## 2. Feature Engineering (Proper Lags & Ratios)
+
+```{r}
+df <- df %>%
+  arrange(county, year) %>%
+  group_by(county) %>%
+  mutate(
+    price_lag       = lag(housing_price),
+    pop_lag         = lag(population),
+    permits_lag     = lag(permits),
+    income_lag      = lag(median_income),
+    growth_rate     = (housing_price - price_lag) / price_lag,
+    pop_change      = (population - pop_lag) / pop_lag
+  ) %>%
+  ungroup() %>%
+  drop_na(growth_rate, pop_change, permits_lag)
+```
+
+## 3. Target Distribution
+
+```{r}
+ggplot(df, aes(growth_rate)) +
+  geom_histogram(bins=40, fill="steelblue", color="white") +
+  scale_x_continuous(labels=percent_format(accuracy=1)) +
+  labs(
+    title = "Distribution of Annual Housing Price Growth",
+    x = "Growth Rate", y = "Count"
+  ) +
+  theme_minimal()
+```
+
+## 4. Leave‐One‐Year‐Out CV: Linear vs Random Forest
+
+```{r}
+# Define features for baseline
+features_base <- c("pop_change","permits_lag")
+years <- sort(unique(df$year))
+res <- map_df(years, function(test_year) {
+  train <- filter(df, year != test_year)
+  test  <- filter(df, year == test_year)
+  # Normalize on train
+  pre <- preProcess(train[features_base], method="range")
+  Xtr <- predict(pre, train[features_base])
+  Xte <- predict(pre, test[features_base])
+  # RF
+  rf_mod    <- randomForest(x=Xtr, y=train$growth_rate, importance=TRUE)
+  pred_rf   <- predict(rf_mod, Xte)
+  rmse_rf   <- RMSE(pred_rf, test$growth_rate)
+  # Linear
+  lm_mod    <- lm(growth_rate ~ pop_change + permits_lag, data=train)
+  pred_lm   <- predict(lm_mod, test)
+  rmse_lm   <- RMSE(pred_lm, test$growth_rate)
+  tibble(
+    year     = test_year,
+    RMSE_RF  = rmse_rf,
+    RMSE_LM  = rmse_lm
+  )
+})
+# Boxplot of RMSE by model
+ggplot(res %>% pivot_longer(-year, names_to="model", values_to="rmse"),
+       aes(x=model, y=rmse, fill=model)) +
+  geom_boxplot() +
+  labs(
+    title = "Leave‑One‑Year‑Out RMSE by Model",
+    x     = "Model", y = "RMSE"
+  ) +
+  theme_minimal() +
+  theme(legend.position="none")
+```
+
+
+## 5. RF Feature Importance (Check Correlation)
+
+```{r}
+# Assess correlated features via per-year RF importances (IncNodePurity)
+
+# Define features that now exist in df
+features_all <- c(
+  "income_lag","nonfamily_income","permits_lag",
+  "income_25_44","income_45_64",
+  "Income_to_Permits","Price_to_Permits","pop_change"
+)
+
+imp_time <- map_df(years, function(yr) {
+  sub <- filter(df, year==yr)
+  # Ensure all features are available
+  rf  <- randomForest(x = sub[features_all], y = sub$growth_rate,
+                      importance = TRUE)
+  im  <- importance(rf, type = 2)[, "IncNodePurity"]
+  tibble(Year = yr, Feature = names(im), Importance = im)
+})
+
+# Plot mean importance to identify correlated predictors
+imp_time %>%
+  group_by(Feature) %>%
+  summarize(mean_imp = mean(Importance)) %>%
+  arrange(desc(mean_imp)) %>%
+  slice_head(n = 10) %>%
+  ggplot(aes(reorder(Feature, mean_imp), mean_imp)) +
+  geom_col(fill = "coral") +
+  coord_flip() +
+  labs(
+    title = "Top 10 Mean RF Importances by Feature",
+    x = NULL, y = "Mean Importance (Node Purity)"
+  ) +
+  theme_minimal()
+```
+
+
+*Decision:* The `income_*` features are highly correlated → we will keep only `pop_change` and `permits_lag` for the baseline.  
+
+## 6. Final Linear Model with Region Interactions
+
+```{r}
+# Map FIPS to Census region
+theregions <- c(
+  "01"="South","02"="West","04"="West","05"="South","06"="West",
+  "08"="West","09"="Northeast","10"="South","11"="South","12"="South",
+  "13"="South","15"="West","16"="West","17"="Midwest","18"="Midwest",
+  "19"="Midwest","20"="Midwest","21"="South","22"="South","23"="Northeast",
+  "24"="South","25"="Northeast","26"="Midwest","27"="Midwest","28"="South",
+  "29"="Midwest","30"="West","31"="Midwest","32"="West","33"="Northeast",
+  "34"="Northeast","35"="West","36"="Northeast","37"="South","38"="Midwest",
+  "39"="Midwest","40"="South","41"="West","42"="Northeast","44"="Northeast",
+  "45"="South","46"="Midwest","47"="South","48"="South","49"="West",
+  "50"="Northeast","51"="South","53"="West","54"="South","55"="Midwest",
+  "56"="West"
+)
+
+df2 <- df %>%
+  mutate(
+    state_fips = substr(GEO_chr,1,2),
+    region     = factor(theregions[state_fips],
+                        levels=c("Northeast","Midwest","South","West"))
+  ) %>% drop_na(region)
+
+# Create region dummies + interactions
+
+dummy <- model.matrix(~ region - 1, data = df2)
+colnames(dummy) <- sub("region", "is_", colnames(dummy))
+
+df3 <- bind_cols(df2, as_tibble(dummy)) %>%
+  mutate(
+    inc_NE  = income_lag  * is_Northeast,
+    inc_MW  = income_lag  * is_Midwest,
+    inc_SO  = income_lag  * is_South,
+    inc_WE  = income_lag  * is_West,
+    perm_NE = permits_lag * is_Northeast,
+    perm_MW = permits_lag * is_Midwest,
+    perm_SO = permits_lag * is_South,
+    perm_WE = permits_lag * is_West
+  )
+
+# Fit per-year regressions and extract betas
+betas <- map_df(years, function(yr) {
+  sub <- filter(df3, year == yr)
+  fmla <- growth_rate ~ inc_NE + inc_MW + inc_SO + inc_WE +
+                     perm_NE + perm_MW + perm_SO + perm_WE
+  lm_i <- lm(fmla, data = sub)
+  coefs <- coef(lm_i)[-1]  # drop intercept
+  # Create tibble with year and named coefficient columns
+  tibble(year = yr) %>%
+    bind_cols(as_tibble(as.list(coefs)))
+})
+
+# Plot 8 interaction betas over time
+betas_long <- betas %>%
+  pivot_longer(-year, names_to = "term", values_to = "beta")
+
+betas_long <- betas %>%
+  pivot_longer(-year, names_to="term", values_to="beta")
+
+ggplot(betas_long, aes(x=year, y=beta, color=term)) +
+  geom_line(size=1) + geom_point() +
+  labs(
+    title = "Per-Year Interaction Betas: Income & Permits by Region",
+    x = "Year", y = "Coefficient"
+  ) +
+  theme_minimal()
+```
+
+
+## 7. Spatial Residual Map by Year
+
+
+```{r}
+
+# Compute per-county residuals and map to regions
+resid_df <- map_df(years, function(yr) {
+  sub <- filter(df3, year == yr)
+  lm_i <- lm(growth_rate ~ inc_NE + inc_MW + inc_SO + inc_WE +
+                       perm_NE + perm_MW + perm_SO + perm_WE,
+             data = sub)
+  sub %>%
+    mutate(
+      resid = growth_rate - predict(lm_i, sub)
+    ) %>%
+    select(state_fips, region, year, resid)
+})
+
+# Average residual by region and year
+grid <- resid_df %>%
+  group_by(region, year) %>%
+  summarize(avg_resid = mean(resid, na.rm = TRUE), .groups = 'drop')
+
+# Plot heatmap
+library(ggplot2)
+
+ggplot(grid, aes(x = factor(year), y = region, fill = avg_resid)) +
+  geom_tile(color = "white") +
+  scale_fill_gradient2(
+    low      = "blue", mid = "white", high = "red", midpoint = 0,
+    name     = "Avg Residual"
+  ) +
+  labs(
+    title    = "Average Residual by Region and Year",
+    x        = "Year",
+    y        = "Census Region"
+  ) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+```
