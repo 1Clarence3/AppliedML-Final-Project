@@ -1,6 +1,4 @@
 ---
-title: "Proj2"
-author: "David Moran"
 date: "2025-05-06"
 output: pdf_document
 ---
@@ -9,7 +7,7 @@ output: pdf_document
 knitr::opts_chunk$set(echo = TRUE)
 ```
 
-## “Which socioeconomic and housing-market factors most strongly influence year-over-year county-level housing-price growth, and how do those drivers vary across Census regions and over time?”
+## The main problem we're addressing is: “Which socioeconomic and housing-market factors most strongly influence county-level median housing-price growth, and how do those drivers vary across Census regions?”
 
 ```{R, warning = FALSE}
 
@@ -25,16 +23,17 @@ lapply(required, library, character.only=TRUE)
 options(tigris_use_cache = TRUE)
 ```
 
+#### Data Loading: We're loading a combined csv that has featuers for each US county from 2012 to 2022
+
 ```{r load-data}
-#2. Load Data & Inspect 
 data_path <- "updated_projectdata.csv"
 df        <- read_csv(data_path)
 cat("Rows × Cols:", dim(df), "\n")
 glimpse(df)
 ```
 
+#### The univariate EDA code below shows some basic statistics for certain important features we thought would be important 
 ```{r uni-eda}
-#Univariate EDA 
 skim(df %>% select(
   median_income, housing_price, permits, Affordability_Index
 ))
@@ -47,8 +46,9 @@ df %>% select(median_income, housing_price, Affordability_Index) %>%
     labs(title="Key Variable Distributions")
 ```
 
+#### Used correlation matrix to see relationships between variables (strength & directions of correlation). This way, if some features are too strongly correlated, we may drop them.
+
 ```{r corr-matrix}
-#=== 5. Correlation Analysis =================================================
 num_df <- df %>%
   select(median_income, nonfamily_income, housing_price,
          permits, income_25_44, income_45_64,
@@ -57,18 +57,20 @@ num_df <- df %>%
 M <- cor(num_df, use="pairwise.complete.obs")
 corrplot(M, method="color", addCoef.col="black",
          tl.cex=0.7, title="Correlation Matrix", mar=c(0,0,1,0))
+
 ```
 
+#### The first plot below shows average county-level housing price for each year. As you can see, it steadily increases. This might continue given current tariff/economic situation, which applies to our audience. To better visualize this increase, the second plot shows the average annual growth rate (% change in housing price relative to the prior year) of county-level housing prices over time. The results are more revealing here: after covid there was a sharp jump in price % change.
+
 ```{r time-trends-fixed}
-#=== 6. Temporal Trends ======================================================
 df %>%
   group_by(year) %>%
-  summarize(avg_price = mean(housing_price, na.rm=TRUE)) %>%
-  ggplot(aes(year, avg_price)) +
-    geom_line(color="steelblue", size=1) +
-    geom_point(color="steelblue", size=2) +
-    scale_y_continuous(labels=scales::dollar_format()) +
-    labs(title="Average County Housing Price by Year", x="Year", y="Avg. Price (USD)") +
+  summarize(avg_price = mean(housing_price, na.rm = TRUE)) %>%
+  ggplot(aes(x = factor(year), y = avg_price)) +  # Treat year as a factor
+    geom_line(group = 1, color = "steelblue", size = 1) +  # group=1 is needed for line across factors
+    geom_point(color = "steelblue", size = 2) +
+    scale_y_continuous(labels = scales::dollar_format()) +
+    labs(title = "Average County Housing Price by Year", x = "Year", y = "Avg. Price (USD)") +
     theme_minimal()
 
 df %>%
@@ -77,17 +79,18 @@ df %>%
   mutate(growth = (housing_price - lag(housing_price)) / lag(housing_price)) %>%
   ungroup() %>%
   group_by(year) %>%
-  summarize(avg_growth = mean(growth, na.rm=TRUE)) %>%
-  ggplot(aes(year, avg_growth)) +
-    geom_line(color="darkgreen", size=1) +
-    geom_point(color="darkgreen", size=2) +
-    scale_y_continuous(labels=scales::percent_format(accuracy=1)) +
-    labs(title="Average Annual Housing Price Growth by Year", x="Year", y="Avg. Growth Rate") +
+  summarize(avg_growth = mean(growth, na.rm = TRUE)) %>%
+  ggplot(aes(x = factor(year), y = avg_growth)) +  # Treat year as a factor
+    geom_line(group = 1, color = "darkgreen", size = 1) +
+    geom_point(color = "darkgreen", size = 2) +
+    scale_y_continuous(labels = scales::percent_format(accuracy = 1)) +
+    labs(title = "Average Annual Housing Price Growth by Year", x = "Year", y = "Avg. Growth Rate") +
     theme_minimal()
+
 ```
 
+#### GEO_ID, which is unique to each county, is used to extract state and county FIPS codes. We then rendered a map where each county is shaded by its housing price growth rate (spatial-choropleth graph)
 ```{r spatial-choropleth}
-#=== 7. Spatial Choropleth ===================================================
 df_map <- df %>%
   mutate(
     GEO_chr     = as.character(GEO_ID),
@@ -104,11 +107,16 @@ ggplot(map_df) +
   geom_sf(aes(fill=growth_rate), color=NA) +
   scale_fill_viridis_c(labels=scales::percent_format()) +
   labs(title="County‐Level Annual Housing Price Growth", fill="Growth Rate") +
-  theme_void()
+  theme_void() + coord_sf(expand = FALSE)
+
 ```
 
+#### Lagged values are computed for housing price, income, population, and permits to enable calculation of year-over-year changes. The features we engineered were as follows:
+#### Growth rate
+#### price_income_ratio: captures housing affordability by comparing housing price to median income
+#### pop_change: annual population growth as %
+#### logs of price and income, which reduce skewness and enable modeling of relative changes
 ```{r feat-eng}
-#=== 8. Feature Engineering ==================================================
 df <- df %>%
   arrange(county, year) %>%
   group_by(county) %>%
@@ -127,21 +135,15 @@ df <- df %>%
 ```
 
 
+#### Setting up features and ensuring cross validation is used for our 1st model below
 ```{r}
-
-
-
-#=== 9. Define Features & CV Control ========================================
 features <- c("pop_change","permits_lag")
 ctrl     <- trainControl(method="cv", number=5)
 ```
 
+### We first did a baseline model using linear regression. To simulate a baseline, we used 1 demand feature (pop_change) and 1 supply feature (permits_lag) to predict annual housing price growth
+#### RMSE and MAE were used across cross-validation folds. Although the RMSE and MAE values are quite low, this model doesn't really help our audience given that young adults will likely consider more factors beyond population change and permits. 
 ```{r baseline-lm}
-#=== 10. Baseline Model: Linear Regression ===================================
-# What: Predict growth as a linear function of pop_change and permits_lag
-# How: 5-fold CV via caret::train(method="lm")
-
-
 # filter out any rows with NA in the response or predictors
 df_model <- df %>%
   drop_na(growth_rate, pop_change, permits_lag)
@@ -158,16 +160,14 @@ lm_baseline <- train(
 # Report baseline performance
 cat("Linear Baseline CV RMSE:", round(lm_baseline$results$RMSE,4), "  ")
 cat("CV MAE:", round(lm_baseline$results$MAE,4), "\n")
-
-
 ```
 
 
-
+#### Moving on from the baseline, we tried using random forest model with a broader set of engineered features as predictors (e.g., income ratios, log-transformed values).  Again, we trained the model with 5-fold cross-validation and used RMSE as our validation metric. After training, feature importances are extracted to identify which variables most strongly influence growth, and the top 10 are shown in a table, with the top 5 visualized in a bar chart
+#### The reason for using this model was because based on the linear model above as well as the complx nature of real estate, we though there could be many complex and nonlinear relationships which random forests can handle
+#### As for explaining the importance values in the bar graph, each decision tree in the forest is built by recursively splitting the data based on feature thresholds that best reduce a loss function. Here, the impurity is MSE and every time a feature is used to split a node, the reduction in MSE caused by that split is recorded. So basically this reduction is credited to the feature used for that split. Then across all trees these impurity reductions are summed for each feature which gives a raw importance score. We decided to normalize them out of 100 below.
 
 ```{r rf-cv}
-#=== 10. Random Forest & CV ==================================================
-# What: fit RF with 5-fold CV; Why: powerful nonparametric model + generalization test
 features  <- c(
   "median_inc_lag","nonfamily_income","permits_lag",
   "income_25_44","income_45_64",
@@ -209,11 +209,10 @@ ggplot(imp_rf[1:5, ], aes(x = reorder(Feature, Importance), y = Importance)) +
 
 ```
 
-
+#### We first set up feature list and CV control for all models. Then we used ridge regression as another baseline leveraging penalized linear modeling. The same 5-fold CV was used. Unlike OLS like in the homeworks, ridge adds an L2 penalty (controlled by λ) that shrinks coefficients to reduce overfitting. We did that and set alpha=0 to specify Ridge (alpha = 1 would've been LASSO). A wide grid of lambda values was tested below to find the optimal level of regularization via cross-validation
+#### We chose this model as it handles multicollinearity and provides a stronger parametric benchmark than mean or simple persistence
 ```{r}
 
-#=== 9. Define Features & CV Control ========================================
-# What: Set up feature list and CV control for all models
 features <- c(
   "median_inc_lag","nonfamily_income","permits_lag",
   "income_25_44","income_45_64",
@@ -222,11 +221,7 @@ features <- c(
 )
 ctrl <- trainControl(method="cv", number=5)
 
-#=== 10. Baseline Model: Ridge Regression =====================================
-# What: Use ridge regression as the ‘dumb yet reasonable’ baseline leveraging penalized linear modeling
-# How: 5-fold CV over lambda grid with alpha=0 via caret::train
-# Why: Handles multicollinearity and provides a stronger parametric benchmark than mean or simple persistence
-
+#Ridge regression
 y <- df$growth_rate
 ridge_grid <- expand.grid(alpha = 0,
                           lambda = 10^seq(-4, 1, length = 50))
@@ -249,10 +244,10 @@ cat("Ridge Baseline CV MAE:", round(min(ridge_baseline$results$MAE, na.rm=TRUE),
 ")
 ``` 
 
-
+#### We compared the performances of all 3 models (Linear vs Ridge vs Random Forest) below. As you can see, the
 ```{r}
 
-#=== 13. Model Comparison: Linear vs Ridge vs Random Forest =================
+
 mod_results <- tibble(
   Model   = c("Linear Regression", "Ridge Baseline", "Random Forest"),
   RMSE_CV = c(
@@ -275,14 +270,16 @@ ggplot(mod_results, aes(x=Model, y=RMSE_CV, fill=Model)) +
   ) +
   theme_minimal()
 
-
 ```
 
 
+#### Now extending off of these results, it would be helpful to our audience if we analyzed the feature importances with temporal data. So what we did was fit a random forest model separately for each year to assess how feature importance changes over time. We then computed a mean importance for each feature across years and plotted the importance trends for the top 5 features with the highest average importance.
+
+#### It is important to note the importance that was calculated/explained before using caret::varImp() is different from the one here. Now, with randomForest::importance(), this directly extracts raw mean decrease in MSE from the random forest model. I mentioned mean decrease in MSE instead of accuracy because in our case randomForest(x, y) is on aregression problem, and the mean decrease in MSE is reported per feature. This value reflects how much including that feature reduces prediction error, averaged across trees. Let's just take a concrete example: A value of 1.6 means that omitting that feature increases the mean squared error across trees by about 1.6 units (on average).
+
+#### Now actually looking at the plot, the feature of median income jumps out as being very predictive of county-level housing price growth relative to the rest of the features. The other features of median income for young to middle-aged adults as well as the supply of permits are close in importance. And as for a more general trend, all the features jump in importance post-covid.
 
 ```{R}
-
-
 years <- sort(unique(df$year))
 imp_time <- map_df(years, function(yr){
   sub <- filter(df, year==yr)
@@ -300,21 +297,18 @@ top_feats <- imp_time %>%
 
 imp_time %>%
   filter(Feature %in% top_feats) %>%
-  ggplot(aes(x=Year,y=Importance,color=Feature)) +
-    geom_line(size=1) + geom_point() +
-    labs(title="Top 5 Predictors: Importance Over Time")
-
-
+  ggplot(aes(x = Year, y = Importance, color = Feature)) +
+    geom_line(size = 1) + 
+    geom_point() +
+    scale_x_continuous(breaks = years) + 
+    labs(title = "Top 5 Predictors: Importance Over Time", x = "Year") +
+    theme_minimal()
 ```
 
-
+#### Now we've looked at the features from above, and introduced how we got both the ridge and random forest importance values, the next logical step would be to compare the important features obtained from our different models. We then plotted the top 5 features (by importance) within each model.
 ```{r}
-
 library(ggplot2)
 library(tidytext)
-
-#=== 14. Feature‐Importance for Linear & Ridge ================================
-
 
 # Ridge regression importances:
 imp_ridge <- varImp(ridge_baseline)$importance %>%
@@ -328,7 +322,7 @@ imp_rf2 <- imp_rf %>% mutate(Model = "RF")
 # Combine all three:
 imp_all <- bind_rows(imp_ridge, imp_rf2)
 
-#=== 15. Plot Top 5 per Model =================================================
+# Plot Top 5 per Model
 top5_all <- imp_all %>%
   group_by(Model) %>%
   slice_max(order_by = Importance, n = 5) %>%
@@ -343,23 +337,25 @@ ggplot(top5_all, aes(x = reorder_within(Feature, Importance, Model),
   labs(title = "Top 5 Predictors by Model (Coefficient‐based Importance)",
        x = NULL, y = "Importance (absolute, scaled)") +
   theme_minimal()
-
-
-
 ```
 
 
+#### Having analyzed the important features from a temporal perspective, we want to close by addressing our question at the very beginning of how top predictors vary across U.S. regions since different regions may have distinct housing market dynamics
 
+#### We did the following steps:
+#### 1. Region Mapping: Map county FIPS codes to U.S. Census regions using the state FIPS prefix.
+#### 2. Balanced Sampling: Balance each region's dataset by sampling the same number of counties (min_n) to avoid sample size bias. This esures fair comparison of variable importances across regions.
+#### 3. Regional Random Forest Fits: For each region, we trained a separate Random Forest on the balanced sample, then extracted permutation-based variable importance (IncMSE = increase in MSE when feature is permuted). And just like before, collected importances for analysis.
+#### 4. Plot: Lastly, we plooted the region-wise importance of the top 5 predictors (based on full-RF importances).
+
+#### In terms of how we determined the 4 regions (midwest, northeast, south, west), we got the GEO_ID that starts with a 2-digit FIPS code representing the state and mapped them to the four standard U.S. Census Bureau regions manually as shown below. 
 
 ```{r}
-
-#=== 15. Spatial Variation of Importances (Balanced Sample)
-# What: Assess how key predictors vary across regions using a balanced Random Forest approach
-# How: First compute each region’s sample size, then randomly sample the same number of counties (min_n) from each region to avoid sample-size bias. For each region, fit a Random Forest to predict annual price growth (growth_rate) using our feature set and extract variable importances (increase in MSE when permuted).
+# Spatial Variation of Importances (Balanced Sample)
 # Baseline: We previously established a mean-growth baseline RMSE (~0.10) and overall Random Forest CV RMSE (~0.02). Here, we hold the model type and hyperparameters fixed (the RF trained per region uses the same features and default parameters) and focus on comparing variable importances across regions.
 # Model: Random Forest regression (caret/RF) with balanced region-specific training sets.
  
-# A) Manual FIPS→Region mapping
+# Manual FIPS→Region mapping
 fips_to_region <- c(
   "01"="South","02"="West","04"="West","05"="South","06"="West",
   "08"="West","09"="Northeast","10"="South","11"="South","12"="South",
@@ -381,7 +377,7 @@ df_regions <- df %>%
     region     = fips_to_region[state_fips]
   )
 
-# B) Filter to valid regions and balance sample sizes
+# Filter to valid regions and balance sample sizes
 region_counts <- df_regions %>%
   filter(!is.na(region)) %>%
   count(region, name="n")
@@ -401,7 +397,7 @@ imp_reg_balanced <- map_df(region_counts$region, function(rgn) {
   )
 })
 
-# C) Plot balanced importances for top features
+# Plot balanced importances for top features
 imp_reg_balanced %>%
   filter(Feature %in% imp_rf$Feature[1:5]) %>%
   ggplot(aes(x = Region, y = Importance, fill = Region)) +
