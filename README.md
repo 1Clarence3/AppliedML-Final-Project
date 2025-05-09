@@ -5,4 +5,12 @@ We investigated which demand and supply factors most strongly influence US count
 
 
 ### Data
-All data was obtained from United States Census Bureau (https://data.census.gov).
+All demand data was obtained from United States Census Bureau (https://data.census.gov). The supply data (permits) was taken from this link: https://hudgis-hud.opendata.arcgis.com/datasets/HUD%3A%3Aresidential-construction-permits-by-county/about.
+
+Reference data.ipynb for getting the datasets and formatting them to run in Model.Rmd
+
+### Files
+- 'Final_Report.pdf' is our written report for our project, with graphs and explanations
+- 'Model.Rmd' is the main R code used to analyze the data, train models, and output graphs and results
+- 'Final_Code.pdf' is a knitted pdf file of 'Model.Rmd' with outputs shown
+- 'data.ipynb' is a preprocessing file for downloading the dataset and formatting it
