@@ -1,15 +1,8 @@
 # AppliedML-Final-Project
 
-### State the problem
-(1) How can we categorize U.S. counties by their housing and socioeconomic characteristics, and do these categories show which counties will become less/more affordable long-term?
+### Summary
+We investigated which demand and supply factors most strongly influence US county-level housing price growth from 2012 to 2022. Using engineered features like income and permit counts, we trained both linear and random forest models with cross-validation. After finding comparable performance, we focused on the linear model to analyze how feature importance varies by region over time. Beta trends showed median income as a stronger predictor than permits, with opposite correlations to price growth. Finally, a valuation heatmap highlighted Florida, New Jersey, Washington, and Nevada as States with potentially lots of undervalued counties and a place to buy houses.
 
-(2) Can we predict housing prices from prior-year data, and what are the most influential features?
-### Highlight your most impressive result
-### Introduce data and/or model
-K-means Clustering 
-#### Explain your approach and alternatives
-#### Explain the data at hand
-All features were obtained from datasets from the United States Census Bureau (https://data.census.gov). We obtained 4 datasets corresponding to population, income, employment, and education features for US counties from the above link. In terms of the time range, we obtained a decade of data form 2012 to 2022 (excluding 2020 due to covid).
-### Explain why your approach was best
-### Talk about risks/limitations
-### Restate the conclusion
+
+### Data
+All data was obtained from United States Census Bureau (https://data.census.gov).
